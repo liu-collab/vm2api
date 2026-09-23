@@ -1,0 +1,174 @@
+# Mirror release tags from the upstream repo (dofastted/vm2api) into this fork.
+#
+# Design notes:
+#   * Tags are pushed with the default GITHUB_TOKEN. Pushes made with GITHUB_TOKEN
+#     do NOT trigger other workflows, so release.yml (Go + Rust build, ~40 min,
+#     creates a GitHub Release) is intentionally NOT fired for mirrored tags.
+#     If you ever want the fork to build its own artifacts, push the tag manually
+#     with your own credentials instead of relying on this workflow.
+#   * Nothing here touches main. Mirrored tags may point at commits that are not
+#     reachable from this fork's main (the fork is a snapshot, not a full mirror).
+#   * A tag that already exists in this fork is never overwritten. If it points at
+#     a different commit than upstream, it is reported in the run summary only.
+name: sync-upstream-tags
+
+on:
+  schedule:
+    # 02:17 UTC every day == 10:17 Asia/Shanghai
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report what would be mirrored, do not push tags'
+        required: false
+        type: boolean
+        default: false
+      upstream:
+        description: 'Upstream owner/repo to mirror tags from'
+        required: false
+        type: string
+        default: 'dofastted/vm2api'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-tags
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve settings
+        id: cfg
+        env:
+          UPSTREAM_INPUT: ${{ github.event.inputs.upstream }}
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          upstream="${UPSTREAM_INPUT:-dofastted/vm2api}"
+          dry_run="${DRY_RUN_INPUT:-false}"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "Upstream: $upstream"
+          echo "Dry run : $dry_run"
+
+      - name: Checkout fork (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch upstream tags
+        env:
+          UPSTREAM: ${{ steps.cfg.outputs.upstream }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Tags only: no upstream branch objects are added to this checkout.
+          git fetch --tags --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${UPSTREAM}.git" \
+            "+refs/tags/*:refs/tags/*"
+
+      - name: Compare and push missing tags
+        id: sync
+        env:
+          UPSTREAM: ${{ steps.cfg.outputs.upstream }}
+          DRY_RUN: ${{ steps.cfg.outputs.dry_run }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          remote_url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # Every upstream tag ref, e.g. refs/tags/v1.3.29 (annotated tags also
+          # expose a peeled ^{} ref, which we skip).
+          mapfile -t upstream_refs < <(
+            git for-each-ref --format='%(refname)' 'refs/tags/*' | grep -v '\^{}$' || true
+          )
+
+          # Tag refs already published in this fork.
+          mapfile -t local_refs < <(git ls-remote --tags --refs "$remote_url" | cut -f2 || true)
+          declare -A published=()
+          for ref in "${local_refs[@]:-}"; do
+            [ -n "$ref" ] && published["$ref"]=1
+          done
+
+          added=()
+          skipped=()
+
+          for ref in "${upstream_refs[@]:-}"; do
+            [ -n "$ref" ] || continue
+            name="${ref#refs/tags/}"
+
+            if [ -n "${published[$ref]:-}" ]; then
+              # Already present: verify it still points at the same object.
+              upstream_sha="$(git rev-parse "$ref")"
+              fork_sha="$(git ls-remote "$remote_url" "$ref" | cut -f1)"
+              if [ "$upstream_sha" != "$fork_sha" ]; then
+                skipped+=("$name (fork=$fork_sha upstream=$upstream_sha) - NOT overwritten")
+                echo "::warning title=Diverged tag::$name exists in the fork at $fork_sha but upstream has $upstream_sha; left untouched."
+              fi
+              continue
+            fi
+
+            # Object and history for this tag must exist locally before pushing.
+            git rev-parse "$ref^{commit}" >/dev/null 2>&1 || {
+              echo "::error title=Unresolvable tag::Cannot resolve $name to a commit."
+              exit 1
+            }
+
+            added+=("$name")
+          done
+
+          echo "### sync-upstream-tags" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- upstream: \`${UPSTREAM}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- upstream tags seen: \`${#upstream_refs[@]}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tags already in fork: \`${#published[@]}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tags to mirror: \`${#added[@]}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${#added[@]}" -eq 0 ]; then
+            echo "Nothing to do: the fork already has every upstream tag."
+            echo "Nothing to mirror." >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Tags to mirror: %s\n' "${added[*]}"
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "Dry run: not pushing."
+              {
+                echo "Dry run - would mirror:"
+                echo ""
+                printf -- '- `%s`\n' "${added[@]}"
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              # Push every missing tag in one atomic transaction.
+              refspecs=()
+              for name in "${added[@]}"; do
+                refspecs+=("refs/tags/${name}:refs/tags/${name}")
+              done
+              # --atomic: either every tag lands or none does.
+              git push --atomic "$remote_url" "${refspecs[@]}"
+              {
+                echo "Mirrored:"
+                echo ""
+                printf -- '- `%s`\n' "${added[@]}"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+          if [ "${#skipped[@]}" -gt 0 ]; then
+            {
+              echo ""
+              echo "Diverged (left untouched):"
+              echo ""
+              printf -- '- %s\n' "${skipped[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "mirrored=${#added[@]}" >> "$GITHUB_OUTPUT"
