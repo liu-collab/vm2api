@@ -81,6 +81,12 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          # Must stay false. actions/checkout otherwise writes
+          #   http.https://github.com/.extraheader = AUTHORIZATION: basic <GITHUB_TOKEN>
+          # into the local git config. That header outranks credentials embedded in
+          # the remote URL, so every push would silently authenticate as GITHUB_TOKEN
+          # (which lacks `workflows` permission) instead of SYNC_TOKEN.
+          persist-credentials: false
 
       - name: Fetch upstream tags
         env:
@@ -104,6 +110,13 @@ jobs:
 
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Belt and braces: drop any Authorization header checkout may have left
+          # behind, so pushes really use SYNC_TOKEN.
+          git config --local --unset-all 'http.https://github.com/.extraheader' || true
+
+          echo "Authenticated as: $(gh api user --jq .login)"
+          echo "Token scopes     : $(gh api -i user 2>/dev/null | grep -i '^x-oauth-scopes:' || echo '(fine-grained)')"
 
           remote_url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
