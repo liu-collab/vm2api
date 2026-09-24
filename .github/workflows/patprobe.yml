@@ -1,0 +1,21 @@
+name: patprobe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe PAT creating a tag ref whose tree differs from default branch
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          echo "token configured: ${GH_TOKEN:+yes}"
+          sha=$(gh api repos/dofastted/vm2api/commits/v1.3.42 --jq .sha)
+          echo "target commit (v1.3.42): $sha"
+          gh api --method POST repos/${{ github.repository }}/git/refs \
+            -f ref="refs/tags/zzpat-probe" -f sha="$sha" \
+            && echo "PAT_CREATE=OK" || echo "PAT_CREATE=DENIED"
+          gh api --method DELETE repos/${{ github.repository }}/git/refs/tags/zzpat-probe \
+            && echo "PAT_DELETE=OK" || echo "PAT_DELETE=FAILED"
