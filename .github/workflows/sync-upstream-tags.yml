@@ -1,11 +1,21 @@
 # Mirror release tags from the upstream repo (dofastted/vm2api) into this fork.
 #
 # Design notes:
-#   * Tags are pushed with the default GITHUB_TOKEN. Pushes made with GITHUB_TOKEN
-#     do NOT trigger other workflows, so release.yml (Go + Rust build, ~40 min,
-#     creates a GitHub Release) is intentionally NOT fired for mirrored tags.
-#     If you ever want the fork to build its own artifacts, push the tag manually
-#     with your own credentials instead of relying on this workflow.
+#   * Tags are pushed with the SYNC_TOKEN repository secret, NOT with GITHUB_TOKEN.
+#     GITHUB_TOKEN cannot do this job: any tag whose commit contains a
+#     .github/workflows/* file that differs from this fork's default branch is
+#     rejected with "refusing to allow a GitHub App to create or update workflow
+#     ... without `workflows` permission". Upstream edits its workflows constantly
+#     while this fork's main lags far behind, so that applies to nearly every tag.
+#     Verified 2026-09-24: GITHUB_TOKEN -> 403, both via git push and the refs API.
+#     SYNC_TOKEN must be a fine-grained PAT scoped to this repository with
+#     "Contents: Read and write" + "Workflows: Read and write".
+#   * If SYNC_TOKEN is missing the job fails fast with a clear message instead of
+#     silently reporting success.
+#   * Because SYNC_TOKEN is a personal token (not GITHUB_TOKEN), pushing a tag DOES
+#     fire release.yml (Go + Rust build, ~40 min, creates a GitHub Release) for each
+#     mirrored tag. That is the price of mirroring into this fork; if the artifact
+#     builds are unwanted, disable release.yml or drop the tag trigger from it.
 #   * Nothing here touches main. Mirrored tags may point at commits that are not
 #     reachable from this fork's main (the fork is a snapshot, not a full mirror).
 #   * A tag that already exists in this fork is never overwritten. If it points at
@@ -55,6 +65,17 @@ jobs:
           echo "Upstream: $upstream"
           echo "Dry run : $dry_run"
 
+      - name: Check SYNC_TOKEN is configured
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SYNC_TOKEN}" ]; then
+            echo "::error title=SYNC_TOKEN missing::Add a repository secret named SYNC_TOKEN (fine-grained PAT, this repo only, Contents: Read and write + Workflows: Read and write). GITHUB_TOKEN cannot mirror tags whose workflow files differ from this fork's default branch."
+            exit 1
+          fi
+          echo "SYNC_TOKEN is configured."
+
       - name: Checkout fork (full history + tags)
         uses: actions/checkout@v4
         with:
@@ -64,7 +85,7 @@ jobs:
       - name: Fetch upstream tags
         env:
           UPSTREAM: ${{ steps.cfg.outputs.upstream }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           set -euo pipefail
           # Tags only: no upstream branch objects are added to this checkout.
@@ -77,7 +98,7 @@ jobs:
         env:
           UPSTREAM: ${{ steps.cfg.outputs.upstream }}
           DRY_RUN: ${{ steps.cfg.outputs.dry_run }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           set -euo pipefail
 
